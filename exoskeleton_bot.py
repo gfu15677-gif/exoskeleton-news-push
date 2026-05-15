@@ -314,10 +314,39 @@ def categorize_item(title, snippet):
 
 # ============ 去重 ============
 
+def _title_similarity(title1, title2):
+    """计算两个标题的相似度"""
+    t1 = re.sub(r'[^\w\u4e00-\u9fff]', '', title1).lower()
+    t2 = re.sub(r'[^\w\u4e00-\u9fff]', '', title2).lower()
+    if not t1 or not t2:
+        return 0.0
+    # 互相包含
+    if t1 in t2 or t2 in t1:
+        return 1.0
+    # 最长公共子串
+    shorter, longer = (t1, t2) if len(t1) <= len(t2) else (t2, t1)
+    max_match = 0
+    for i in range(len(shorter)):
+        for j in range(i + max_match + 1, len(shorter) + 1):
+            if shorter[i:j] in longer:
+                max_match = j - i
+    return max_match / max(len(t1), len(t2))
+
+
+def _extract_keywords(title):
+    """从标题中提取关键词用于去重判断"""
+    # 提取4字以上的词作为关键词
+    text = re.sub(r'[^\w\u4e00-\u9fff]', '', title).lower()
+    keywords = set()
+    for i in range(len(text) - 3):
+        keywords.add(text[i:i+4])
+    return keywords
+
+
 def deduplicate(results):
-    """按URL和标题去重"""
+    """按URL和标题去重（增强版：支持标题相似度+关键词重叠去重）"""
     seen_urls = set()
-    seen_titles = set()
+    seen_titles = []
     unique = []
 
     for r in results:
@@ -327,14 +356,36 @@ def deduplicate(results):
         if url in seen_urls:
             continue
 
-        # 标题去重（去掉标点和空格后比较）
         title_simple = re.sub(r'[^\w\u4e00-\u9fff]', '', title).lower()
-        if title_simple and title_simple in seen_titles:
+        is_duplicate = False
+
+        # 1. 精确匹配
+        if title_simple and title_simple in [re.sub(r'[^\w\u4e00-\u9fff]', '', st).lower() for st in seen_titles]:
+            is_duplicate = True
+
+        # 2. 相似度匹配（>0.6认为是同一篇）
+        if not is_duplicate:
+            for seen_title in seen_titles:
+                if _title_similarity(title, seen_title) > 0.6:
+                    is_duplicate = True
+                    break
+
+        # 3. 关键词重叠检测（4字以上关键词重叠>=4个认为是重复）
+        if not is_duplicate:
+            current_kw = _extract_keywords(title)
+            for seen_title in seen_titles:
+                seen_kw = _extract_keywords(seen_title)
+                overlap = current_kw & seen_kw
+                if len(overlap) >= 4:
+                    is_duplicate = True
+                    break
+
+        if is_duplicate:
             continue
 
         seen_urls.add(url)
         if title_simple:
-            seen_titles.add(title_simple)
+            seen_titles.append(title)
 
         unique.append(r)
 
