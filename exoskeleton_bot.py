@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-外骨骼资讯自动推送脚本 v5
-核心改动：新增B站视频搜索数据源
+外骨骼资讯自动推送脚本 v6
+核心改动：跨次运行去重，同一条资讯只推送一次
 数据源：天行数据新闻API(主力) + B站视频搜索 + 36氪RSS + InfoQ中文RSS + Solidot RSS
 所有链接国内直连，无需翻墙
+推送历史通过pushed_history.json持久化，配合GitHub Actions Cache跨次运行
 """
 
 import os
@@ -33,6 +34,12 @@ CST = timezone(timedelta(hours=8))
 
 # 时效性过滤天数
 RECENT_DAYS = 3
+
+# 推送历史文件路径（GitHub Actions通过Cache持久化此文件）
+HISTORY_FILE = os.environ.get("PUSH_HISTORY_FILE", "pushed_history.json")
+
+# 推送历史保留天数（超过此天数的记录自动清理）
+HISTORY_RETAIN_DAYS = 7
 
 
 # ============ 通用工具 ============
@@ -577,6 +584,103 @@ def deduplicate(results):
     return unique
 
 
+# ============ 推送历史（跨次运行去重） ============
+
+def load_push_history():
+    """加载推送历史，返回已推送的URL集合和标题列表"""
+    pushed_urls = set()
+    pushed_titles = []
+    history = []
+
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+
+            now = datetime.now(CST)
+            # 清理超过保留天数的历史记录
+            valid_records = []
+            for record in history:
+                push_time_str = record.get("push_time", "")
+                if push_time_str:
+                    push_time = parse_date_flexible(push_time_str)
+                    if push_time:
+                        if push_time.tzinfo is None:
+                            push_time = push_time.replace(tzinfo=CST)
+                        if (now - push_time).days > HISTORY_RETAIN_DAYS:
+                            continue
+                valid_records.append(record)
+                url = record.get("url", "")
+                if url:
+                    pushed_urls.add(url)
+                title = record.get("title", "")
+                if title:
+                    pushed_titles.append(title)
+
+            print(f"  加载推送历史: {len(valid_records)}条有效记录（保留{HISTORY_RETAIN_DAYS}天内）")
+            # 保存清理后的历史
+            history = valid_records
+    except Exception as e:
+        print(f"  加载推送历史异常: {e}")
+        history = []
+
+    return pushed_urls, pushed_titles, history
+
+
+def filter_by_history(results, pushed_urls, pushed_titles):
+    """过滤掉已推送过的资讯"""
+    new_results = []
+    for r in results:
+        url = r.get("url", "")
+        title = r.get("title", "").strip()
+
+        # URL完全匹配
+        normalized_url = re.sub(r'[?&](f=rss|utm_[^&=]+=[^&]*)', '', url)
+        if normalized_url and normalized_url in pushed_urls:
+            continue
+
+        # 标题相似度匹配
+        title_simple = re.sub(r'[^\w\u4e00-\u9fff]', '', title).lower()
+        is_dup = False
+        if title_simple:
+            for seen in pushed_titles:
+                seen_simple = re.sub(r'[^\w\u4e00-\u9fff]', '', seen).lower()
+                if title_simple == seen_simple:
+                    is_dup = True
+                    break
+                if _title_similarity(title, seen) > 0.7:
+                    is_dup = True
+                    break
+        if is_dup:
+            continue
+
+        new_results.append(r)
+
+    filtered_count = len(results) - len(new_results)
+    if filtered_count > 0:
+        print(f"  历史去重: 过滤{filtered_count}条已推送资讯")
+
+    return new_results
+
+
+def save_push_history(history, new_results):
+    """推送成功后更新历史文件"""
+    now_str = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+    for r in new_results:
+        history.append({
+            "url": r.get("url", ""),
+            "title": r.get("title", ""),
+            "push_time": now_str,
+        })
+
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        print(f"  推送历史已保存: {len(history)}条记录")
+    except Exception as e:
+        print(f"  保存推送历史异常: {e}")
+
+
 # ============ 时效性过滤 ============
 
 def filter_recent(results, days=RECENT_DAYS):
@@ -700,8 +804,8 @@ def send_markdown_to_wechat(content):
 
 def main():
     print("=" * 50)
-    print("外骨骼资讯推送脚本 v5 启动")
-    print(f"版本特性: 国内直连数据源 + B站视频搜索，无需VPN")
+    print("外骨骼资讯推送脚本 v6 启动")
+    print(f"版本特性: 跨次去重 + 国内直连数据源 + B站视频搜索，无需VPN")
     print(f"时间: {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
@@ -720,13 +824,17 @@ def main():
 
     print(f"当前推送: 第{push_index}期")
 
+    # 加载推送历史
+    print("\n📖 加载推送历史...")
+    pushed_urls, pushed_titles, history = load_push_history()
+
     # 搜索
     print("\n开始搜索（国内数据源）...")
     all_results = search_all()
 
     print(f"\n搜索总计: {len(all_results)} 条")
 
-    # 去重
+    # 去重（本次运行内去重）
     unique_results = deduplicate(all_results)
     print(f"去重后: {len(unique_results)} 条")
 
@@ -734,19 +842,30 @@ def main():
     recent_results = filter_recent(unique_results, days=RECENT_DAYS)
     print(f"{RECENT_DAYS}天内: {len(recent_results)} 条")
 
+    # 跨次运行去重（过滤已推送过的）
+    print("\n🔍 跨次运行去重...")
+    new_results = filter_by_history(recent_results, pushed_urls, pushed_titles)
+
     # 分类（B站结果已预设为video，保留不覆盖）
-    for r in recent_results:
+    for r in new_results:
         if r.get("category") != "video":
             r["category"] = categorize_item(r["title"], r.get("snippet", ""))
 
     # 排序：视频 > 科研 > 资讯 > 公司
     category_order = {"video": 0, "research": 1, "news": 2, "company": 3}
-    recent_results.sort(key=lambda x: category_order.get(x["category"], 99))
+    new_results.sort(key=lambda x: category_order.get(x["category"], 99))
 
-    print(f"最终推送: {len(recent_results)} 条")
+    print(f"\n最终推送: {len(new_results)} 条新资讯")
+
+    # 没有新资讯，跳过推送
+    if not new_results:
+        print("\n⏭️ 没有新的外骨骼资讯，本次跳过推送")
+        # 仍然保存历史（清理过期记录）
+        save_push_history(history, [])
+        return
 
     # 构建消息
-    content = build_push_content(recent_results, push_index)
+    content = build_push_content(new_results, push_index)
 
     print("\n推送内容预览:")
     print("-" * 50)
@@ -764,9 +883,11 @@ def main():
     success = send_markdown_to_wechat(content)
 
     if success:
+        # 推送成功，保存历史
+        save_push_history(history, new_results)
         print("✅ 推送完成")
     else:
-        print("❌ 推送失败")
+        print("❌ 推送失败，不更新历史（下次重试）")
         sys.exit(1)
 
 
