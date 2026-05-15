@@ -21,15 +21,28 @@ import re
 WEBHOOK_KEY = os.environ.get("WECHAT_WEBHOOK_KEY", "")
 WEBHOOK_URL = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WEBHOOK_KEY}"
 
-# 搜索关键词列表
+# 搜索关键词列表（去掉年份限制，扩大覆盖面）
 SEARCH_QUERIES = [
-    "外骨骼 最新研究 科研成果 2025 2026",
-    "exoskeleton latest research breakthrough 2025 2026",
-    "外骨骼机器人 公司 融资 产品发布 2025 2026",
-    "exoskeleton company funding product launch 2025 2026",
-    "外骨骼 bilibili 视频 2025 2026",
-    "外骨骼 抖音 视频 最新",
-    "外骨骼 行业资讯 新闻 政策 2025 2026",
+    # 中文 - 综合
+    "外骨骼 最新资讯",
+    "外骨骼机器人 新闻",
+    "外骨骼 行业动态",
+    # 中文 - 科研
+    "外骨骼 研究进展",
+    "外骨骼 科研成果 论文",
+    # 中文 - 公司/产品
+    "外骨骼 融资 产品",
+    "外骨骼机器人 公司 发布",
+    # 中文 - 视频
+    "外骨骼 bilibili",
+    "外骨骼 视频",
+    # 英文 - 综合
+    "exoskeleton news",
+    "exoskeleton robot latest",
+    # 英文 - 科研
+    "exoskeleton research breakthrough",
+    # 英文 - 公司
+    "exoskeleton company funding launch",
 ]
 
 # ============ 工具函数 ============
@@ -94,6 +107,14 @@ def send_markdown_to_wechat(content: str) -> bool:
         return False
 
 
+def _clean_html(text: str) -> str:
+    """清理HTML标签和实体"""
+    text = unescape(text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def search_duckduckgo(query: str) -> list:
     """使用DuckDuckGo搜索获取结果"""
     results = []
@@ -102,27 +123,34 @@ def search_duckduckgo(query: str) -> list:
         url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         }
 
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
-        result_blocks = re.findall(
-            r'<a rel="nofollow" class="result__a" href="([^"]+)">([^<]+)</a>.*?<a class="result__snippet">(.*?)</a>',
-            html,
-            re.DOTALL
-        )
+        # DuckDuckGo HTML结果解析 - 多种正则兼容
+        patterns = [
+            r'<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>.*?<a class="result__snippet"[^>]*>(.*?)</a>',
+            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?(?:result__snippet|result__url)[^>]*>(.*?)</(?:a|span)>',
+        ]
 
-        for href, title, snippet in result_blocks[:5]:
+        result_blocks = []
+        for pattern in patterns:
+            blocks = re.findall(pattern, html, re.DOTALL)
+            if blocks:
+                result_blocks = blocks
+                break
+
+        for href, title, snippet in result_blocks[:8]:
             if href.startswith("//"):
                 href = "https:" + href
             elif href.startswith("/"):
                 href = "https://duckduckgo.com" + href
 
-            title = unescape(re.sub(r'<[^>]+>', '', title)).strip()
-            snippet = unescape(re.sub(r'<[^>]+>', '', snippet)).strip()
+            title = _clean_html(title)
+            snippet = _clean_html(snippet)
 
             if title and href and "duckduckgo.com" not in href:
                 results.append({"title": title, "url": href, "snippet": snippet})
@@ -134,32 +162,39 @@ def search_duckduckgo(query: str) -> list:
 
 
 def search_bing(query: str) -> list:
-    """使用Bing搜索获取结果（备用）"""
+    """使用Bing搜索获取结果"""
     results = []
     try:
         encoded_query = urllib.parse.quote(query)
-        url = f"https://www.bing.com/search?q={encoded_query}&count=5"
+        url = f"https://www.bing.com/search?q={encoded_query}&count=10"
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
-        # Bing搜索结果解析
-        result_blocks = re.findall(
-            r'<li class="b_algo"[^>]*>.*?<h2><a href="([^"]+)"[^>]*>(.*?)</a></h2>.*?<p>(.*?)</p>.*?</li>',
-            html,
-            re.DOTALL
-        )
+        # Bing搜索结果解析 - 多种正则兼容
+        patterns = [
+            r'<li class="b_algo"[^>]*>.*?<h2><a href="([^"]+)"[^>]*>(.*?)</a></h2>.*?<p[^>]*>(.*?)</p>',
+            r'<li class="b_algo"[^>]*>.*?<h2><a href="([^"]+)"[^>]*>(.*?)</a></h2>.*?<div[^>]*>(.*?)</div>',
+            r'<li class="b_algo"[^>]*>.*?<a href="([^"]+)"[^>]*><h2>(.*?)</h2></a>.*?<p[^>]*>(.*?)</p>',
+        ]
 
-        for href, title, snippet in result_blocks[:5]:
-            title = unescape(re.sub(r'<[^>]+>', '', title)).strip()
-            snippet = unescape(re.sub(r'<[^>]+>', '', snippet)).strip()
+        result_blocks = []
+        for pattern in patterns:
+            blocks = re.findall(pattern, html, re.DOTALL)
+            if blocks:
+                result_blocks = blocks
+                break
+
+        for href, title, snippet in result_blocks[:8]:
+            title = _clean_html(title)
+            snippet = _clean_html(snippet)
 
             if title and href:
                 results.append({"title": title, "url": href, "snippet": snippet})
@@ -170,16 +205,82 @@ def search_bing(query: str) -> list:
     return results
 
 
+def search_google(query: str) -> list:
+    """使用Google搜索获取结果（第三备用）"""
+    results = []
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://www.google.com/search?q={encoded_query}&num=10&hl=zh-CN"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+
+        # Google搜索结果解析
+        patterns = [
+            r'<a href="/url\?q=([^&"]+)&[^"]*"[^>]*>.*?<h3[^>]*>(.*?)</h3>.*?</a>.*?<div[^>]*>(.*?)</div>',
+            r'<div class="BNeawe s3v9rd AP7Wnd">(.*?)</div>.*?<div class="BNeawe vvjwJb AP7Wnd">(.*?)</div>.*?<a href="([^"]+)"',
+        ]
+
+        result_blocks = []
+        for pattern in patterns:
+            blocks = re.findall(pattern, html, re.DOTALL)
+            if blocks:
+                result_blocks = blocks
+                break
+
+        for match in result_blocks[:8]:
+            if len(match) == 3:
+                href, title, snippet = match
+            else:
+                continue
+
+            title = _clean_html(title)
+            snippet = _clean_html(snippet)
+
+            # 过滤Google内部链接
+            if title and href and "google.com" not in href and "webcache" not in href:
+                results.append({"title": title, "url": href, "snippet": snippet})
+
+    except Exception as e:
+        print(f"  Google搜索异常: {e}")
+
+    return results
+
+
 def search_web(query: str) -> list:
     """
-    搜索外骨骼相关资讯，优先DuckDuckGo，失败时回退到Bing
+    搜索资讯，依次尝试 DuckDuckGo → Bing → Google
     返回格式: [{"title": "", "url": "", "snippet": ""}, ...]
     """
+    # 第一选择：DuckDuckGo
     results = search_duckduckgo(query)
-    if not results:
-        print(f"  DuckDuckGo无结果，尝试Bing...")
-        results = search_bing(query)
-    return results
+    if results:
+        print(f"    DuckDuckGo: {len(results)}条")
+        return results
+
+    # 第二选择：Bing
+    print(f"  DuckDuckGo无结果，尝试Bing...")
+    results = search_bing(query)
+    if results:
+        print(f"    Bing: {len(results)}条")
+        return results
+
+    # 第三选择：Google
+    print(f"  Bing也无结果，尝试Google...")
+    results = search_google(query)
+    if results:
+        print(f"    Google: {len(results)}条")
+        return results
+
+    print(f"  所有搜索引擎均无结果")
+    return []
 
 
 def categorize_item(title: str, snippet: str) -> str:
@@ -187,15 +288,15 @@ def categorize_item(title: str, snippet: str) -> str:
     text = (title + " " + snippet).lower()
 
     # 视频类
-    if any(kw in text for kw in ["bilibili", "哔哩哔哩", "b站", "抖音", "视频", "video", "youtube"]):
+    if any(kw in text for kw in ["bilibili", "哔哩哔哩", "b站", "抖音", "视频", "video", "youtube", "youku", "优酷"]):
         return "video"
 
     # 科研类
-    if any(kw in text for kw in ["研究", "科研", "论文", "学术", "patent", "research", "study", "breakthrough", "中科院", "研究所", "university"]):
+    if any(kw in text for kw in ["研究", "科研", "论文", "学术", "patent", "research", "study", "breakthrough", "中科院", "研究所", "university", "期刊", "nature", "science", "ieee", "robotics"]):
         return "research"
 
     # 公司动态（融资/产品）
-    if any(kw in text for kw in ["融资", "投资", "轮", "产品", "发布", "launch", "funding", "investment", "series", "million", "billion", "product"]):
+    if any(kw in text for kw in ["融资", "投资", "轮", "产品", "发布", "launch", "funding", "investment", "series", "million", "billion", "product", "首发", "上市", "获投"]):
         return "company"
 
     # 默认归为行业资讯
@@ -292,16 +393,14 @@ def main():
     all_results = []
     print("\n开始搜索...")
 
-    # 随机选3个关键词搜索，避免每次都一样
-    selected_queries = random.sample(SEARCH_QUERIES, min(3, len(SEARCH_QUERIES)))
-
-    for query in selected_queries:
+    # 搜索全部关键词（不再随机抽样）
+    for query in SEARCH_QUERIES:
         print(f"  搜索: {query}")
         results = search_web(query)
         for r in results:
             r["category"] = categorize_item(r["title"], r.get("snippet", ""))
         all_results.extend(results)
-        time.sleep(random.uniform(1, 3))  # 避免请求过快
+        time.sleep(random.uniform(0.5, 2))  # 避免请求过快
 
     # 去重（按URL）
     seen_urls = set()
@@ -320,6 +419,11 @@ def main():
     print("-" * 50)
     print(content[:500] + "..." if len(content) > 500 else content)
     print("-" * 50)
+
+    # 企业微信文本消息限制2048字符，超长则截断
+    if len(content) > 2000:
+        content = content[:1990] + "\n...更多内容下期见"
+        print("消息过长，已截断")
 
     # 发送消息
     print("\n正在推送到企业微信群...")
