@@ -440,9 +440,6 @@ def build_push_content(all_results, push_index):
             else:
                 lines.append(f"{i}. {item['title']}{meta}")
 
-            if item.get("snippet"):
-                snippet = item['snippet'][:50]
-                lines.append(f"   {snippet}...")
         lines.append("")
 
     add_section("🎬", "视频推荐", videos)
