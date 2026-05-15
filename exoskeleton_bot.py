@@ -433,10 +433,15 @@ def build_push_content(all_results, push_index):
                 meta_parts.append(date_display)
             meta = f"（{' · '.join(meta_parts)}）" if meta_parts else ""
 
-            lines.append(f"{i}. {item['title']}{meta}")
-            lines.append(f"🔗 {item['url']}")
+            url = item.get("url", "")
+            # 企业微信支持Markdown链接，把标题做成可点击链接
+            if url:
+                lines.append(f"{i}. [{item['title']}]({url}){meta}")
+            else:
+                lines.append(f"{i}. {item['title']}{meta}")
+
             if item.get("snippet"):
-                snippet = item['snippet'][:80]
+                snippet = item['snippet'][:50]
                 lines.append(f"   {snippet}...")
         lines.append("")
 
@@ -473,6 +478,35 @@ def send_text_to_wechat(content):
             result = json.loads(resp.read().decode("utf-8"))
             if result.get("errcode") == 0:
                 print("消息发送成功")
+                return True
+            else:
+                print(f"发送失败: {result}")
+                return False
+    except Exception as e:
+        print(f"发送异常: {e}")
+        return False
+
+
+def send_markdown_to_wechat(content):
+    """发送Markdown消息到企业微信群（支持可点击链接）"""
+    if not WEBHOOK_KEY:
+        print("错误: 未设置 WECHAT_WEBHOOK_KEY 环境变量")
+        return False
+
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {"content": content}
+    }
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    req = urllib.request.Request(WEBHOOK_URL, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("errcode") == 0:
+                print("Markdown消息发送成功")
                 return True
             else:
                 print(f"发送失败: {result}")
@@ -541,9 +575,9 @@ def main():
         content = content[:1990] + "\n...更多内容下期见"
         print("消息过长，已截断")
 
-    # 发送
+    # 发送（改用markdown消息类型支持可点击链接）
     print("\n正在推送到企业微信群...")
-    success = send_text_to_wechat(content)
+    success = send_markdown_to_wechat(content)
 
     if success:
         print("✅ 推送完成")
