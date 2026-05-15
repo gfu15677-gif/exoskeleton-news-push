@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-外骨骼资讯自动推送脚本 v3
-核心改动：弃用搜索引擎HTML正则解析，改用RSS订阅源 + 新闻API
-RSS返回标准XML，解析100%稳定
+外骨骼资讯自动推送脚本 v5
+核心改动：新增B站视频搜索数据源
+数据源：天行数据新闻API(主力) + B站视频搜索 + 36氪RSS + InfoQ中文RSS + Solidot RSS
+所有链接国内直连，无需翻墙
 """
 
 import os
@@ -22,7 +23,17 @@ import xml.etree.ElementTree as ET
 WEBHOOK_KEY = os.environ.get("WECHAT_WEBHOOK_KEY", "")
 WEBHOOK_URL = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WEBHOOK_KEY}"
 
+# 天行数据API Key（注册https://www.tianapi.com获取，普通会员免费100次/天）
+TIANAPI_KEY = os.environ.get("TIANAPI_KEY", "")
+
+# B站Cookie（可选，用于搜索API防风控；不设置也能用但容易被412拦截）
+BILIBILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
+
 CST = timezone(timedelta(hours=8))
+
+# 时效性过滤天数
+RECENT_DAYS = 3
+
 
 # ============ 通用工具 ============
 
@@ -51,22 +62,25 @@ def parse_date_flexible(date_str):
     """灵活解析多种日期格式"""
     if not date_str:
         return None
+    date_str = date_str.strip()
     formats = [
         "%a, %d %b %Y %H:%M:%S %Z",
         "%a, %d %b %Y %H:%M:%S %z",
         "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d",
     ]
     for fmt in formats:
         try:
-            return datetime.strptime(date_str.strip(), fmt)
+            return datetime.strptime(date_str, fmt)
         except (ValueError, TypeError):
             continue
     return None
 
 
-def is_recent(pub_date_str, days=7):
+def is_recent(pub_date_str, days=RECENT_DAYS):
     """判断发布日期是否在最近N天内"""
     pub_date = parse_date_flexible(pub_date_str)
     if pub_date is None:
@@ -87,7 +101,11 @@ def format_date_display(pub_date_str):
     now = datetime.now(CST)
     delta = now - pub_date
     if delta.days == 0:
-        return "今天"
+        hours = delta.seconds // 3600
+        if hours == 0:
+            minutes = delta.seconds // 60
+            return f"{minutes}分钟前" if minutes > 0 else "刚刚"
+        return f"{hours}小时前"
     elif delta.days == 1:
         return "昨天"
     elif delta.days <= 7:
@@ -96,200 +114,370 @@ def format_date_display(pub_date_str):
         return pub_date.strftime("%m/%d")
 
 
-# ============ 数据源1: Google News RSS（主力） ============
+# ============ 数据源1: 天行数据新闻API（主力） ============
 
-def search_google_news_rss(query, max_results=10):
+def _search_tianapi(endpoint, query, num=10, page=1):
     """
-    Google News RSS 搜索
-    Google官方RSS端点，返回标准XML，极其稳定
-    """
-    results = []
-    try:
-        encoded = urllib.parse.quote(query)
-        url = f"https://news.google.com/rss/search?q={encoded}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
-
-        data = http_get(url)
-        root = ET.fromstring(data)
-
-        items = root.findall(".//item")
-        for item in items[:max_results]:
-            title_elem = item.find("title")
-            link_elem = item.find("link")
-            desc_elem = item.find("description")
-            pubdate_elem = item.find("pubDate")
-            source_elem = item.find("{http://purl.org/dc/elements/1.1/}source")
-
-            title = clean_html(title_elem.text) if title_elem is not None and title_elem.text else ""
-            link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
-            desc = clean_html(desc_elem.text) if desc_elem is not None and desc_elem.text else ""
-            pub_date = pubdate_elem.text if pubdate_elem is not None and pubdate_elem.text else ""
-            source_name = source_elem.text if source_elem is not None and source_elem.text else ""
-
-            # 从description中提取来源信息（Google News RSS的title格式为"标题 - 来源"）
-            if " - " in title and not source_name:
-                parts = title.rsplit(" - ", 1)
-                if len(parts) == 2:
-                    title = parts[0].strip()
-                    source_name = parts[1].strip()
-
-            if title and link:
-                results.append({
-                    "title": title,
-                    "url": link,
-                    "snippet": desc[:200] if desc else "",
-                    "pub_date": pub_date,
-                    "source": source_name or "Google News",
-                })
-
-        print(f"    Google News RSS: {len(results)}条")
-
-    except Exception as e:
-        print(f"    Google News RSS异常: {e}")
-
-    return results
-
-
-# ============ 数据源2: Bing News RSS ============
-
-def search_bing_news_rss(query, max_results=10):
-    """
-    Bing News RSS 搜索
-    Bing也有RSS端点，链接更干净
+    天行数据新闻API通用搜索
+    endpoint: guonei(国内新闻) / generalnews(综合新闻)
+    支持关键词搜索(word参数)，链接为原始来源URL，国内直连
+    免费会员100次/天
     """
     results = []
     try:
-        encoded = urllib.parse.quote(query)
-        url = f"https://www.bing.com/news/search?q={encoded}&format=rss"
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        params = {
+            "key": TIANAPI_KEY,
+            "word": query,
+            "num": num,
+            "page": page,
         }
-
-        data = http_get(url, headers=headers)
-        root = ET.fromstring(data)
-
-        items = root.findall(".//item")
-        for item in items[:max_results]:
-            title_elem = item.find("title")
-            link_elem = item.find("link")
-            desc_elem = item.find("description")
-            pubdate_elem = item.find("pubDate")
-
-            title = clean_html(title_elem.text) if title_elem is not None and title_elem.text else ""
-            link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
-            desc = clean_html(desc_elem.text) if desc_elem is not None and desc_elem.text else ""
-            pub_date = pubdate_elem.text if pubdate_elem is not None and pubdate_elem.text else ""
-
-            # Bing RSS的title格式也经常是"标题 - 来源"
-            source_name = ""
-            if " - " in title:
-                parts = title.rsplit(" - ", 1)
-                if len(parts) == 2:
-                    title = parts[0].strip()
-                    source_name = parts[1].strip()
-
-            if title and link:
-                results.append({
-                    "title": title,
-                    "url": link,
-                    "snippet": desc[:200] if desc else "",
-                    "pub_date": pub_date,
-                    "source": source_name or "Bing News",
-                })
-
-        print(f"    Bing News RSS: {len(results)}条")
-
-    except Exception as e:
-        print(f"    Bing News RSS异常: {e}")
-
-    return results
-
-
-# ============ 数据源3: DuckDuckGo Instant Answer API ============
-
-def search_duckduckgo_api(query, max_results=8):
-    """
-    DuckDuckGo Instant Answer API
-    返回JSON，不是HTML，解析稳定
-    """
-    results = []
-    try:
-        encoded = urllib.parse.quote(query)
-        url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
+        url = f"https://apis.tianapi.com/{endpoint}/index?" + urllib.parse.urlencode(params)
 
         data = http_get(url)
         resp = json.loads(data.decode("utf-8"))
 
-        # 相关主题
-        for topic in resp.get("RelatedTopics", [])[:max_results]:
-            if isinstance(topic, dict) and "Text" in topic and "FirstURL" in topic:
-                text = topic["Text"]
+        if resp.get("code") != 200:
+            print(f"    天行数据({endpoint})返回: code={resp.get('code')}, msg={resp.get('msg')}")
+            return results
+
+        for item in resp.get("result", {}).get("newslist", []):
+            title = item.get("title", "").strip()
+            url_link = item.get("url", "").strip()
+            description = item.get("description", "").strip()
+            source = item.get("source", "").strip()
+            pub_date = item.get("ctime", "").strip()
+
+            if title:
                 results.append({
-                    "title": text[:80] if len(text) > 80 else text,
-                    "url": topic["FirstURL"],
-                    "snippet": text[:200],
-                    "pub_date": "",
-                    "source": "DuckDuckGo",
+                    "title": title,
+                    "url": url_link,
+                    "snippet": description[:200] if description else "",
+                    "pub_date": pub_date,
+                    "source": source,
                 })
 
-        # 直接回答
-        abstract = resp.get("Abstract", "")
-        abstract_url = resp.get("AbstractURL", "")
-        if abstract and abstract_url:
-            results.insert(0, {
-                "title": resp.get("AbstractTitle", abstract[:80]),
-                "url": abstract_url,
-                "snippet": abstract[:200],
-                "pub_date": "",
-                "source": "DuckDuckGo",
-            })
-
-        print(f"    DuckDuckGo API: {len(results)}条")
+        print(f"    天行数据-{endpoint} ({query}): {len(results)}条")
 
     except Exception as e:
-        print(f"    DuckDuckGo API异常: {e}")
+        print(f"    天行数据({endpoint})异常: {e}")
+
+    return results
+
+
+def search_tianapi_news(query, num=10):
+    """同时搜索国内新闻和综合新闻API"""
+    results = []
+    # 国内新闻API
+    results.extend(_search_tianapi("guonei", query, num=num))
+    time.sleep(random.uniform(0.3, 0.6))
+    # 综合新闻API（数据范围更广，覆盖科技频道）
+    results.extend(_search_tianapi("generalnews", query, num=num))
+    return results
+
+
+# ============ 数据源2: 36氪RSS（科技资讯） ============
+
+def search_36kr_rss(max_results=30):
+    """
+    36氪RSS订阅
+    国内可直连，返回科技/创业类资讯
+    不支持关键词搜索，返回最新文章后本地过滤
+    """
+    results = []
+    try:
+        url = "https://36kr.com/feed"
+        data = http_get(url)
+        root = ET.fromstring(data)
+
+        items = root.findall(".//item")
+        for item in items[:max_results]:
+            title_elem = item.find("title")
+            link_elem = item.find("link")
+            desc_elem = item.find("description")
+            pubdate_elem = item.find("pubDate")
+
+            title = clean_html(title_elem.text) if title_elem is not None and title_elem.text else ""
+            link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
+            desc = clean_html(desc_elem.text) if desc_elem is not None and desc_elem.text else ""
+            pub_date = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else ""
+
+            if title and link:
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": desc[:200] if desc else "",
+                    "pub_date": pub_date,
+                    "source": "36氪",
+                })
+
+        print(f"    36氪RSS: {len(results)}条")
+
+    except Exception as e:
+        print(f"    36氪RSS异常: {e}")
+
+    return results
+
+
+# ============ 数据源3: InfoQ中文RSS（技术资讯） ============
+
+def search_infoq_rss(max_results=20):
+    """
+    InfoQ中文RSS
+    国内可直连，返回技术/架构类资讯
+    """
+    results = []
+    try:
+        url = "https://www.infoq.cn/feed"
+        data = http_get(url)
+        root = ET.fromstring(data)
+
+        items = root.findall(".//item")
+        for item in items[:max_results]:
+            title_elem = item.find("title")
+            link_elem = item.find("link")
+            desc_elem = item.find("description")
+            pubdate_elem = item.find("pubDate")
+
+            title = clean_html(title_elem.text) if title_elem is not None and title_elem.text else ""
+            link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
+            desc = clean_html(desc_elem.text) if desc_elem is not None and desc_elem.text else ""
+            pub_date = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else ""
+
+            if title and link:
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": desc[:200] if desc else "",
+                    "pub_date": pub_date,
+                    "source": "InfoQ",
+                })
+
+        print(f"    InfoQ中文RSS: {len(results)}条")
+
+    except Exception as e:
+        print(f"    InfoQ中文RSS异常: {e}")
+
+    return results
+
+
+# ============ 数据源4: Solidot RSS（科技奇客） ============
+
+def search_solidot_rss(max_results=20):
+    """
+    Solidot RSS
+    国内可直连，科技/开源/奇客资讯
+    """
+    results = []
+    try:
+        url = "https://www.solidot.org/index.rss"
+        data = http_get(url)
+        root = ET.fromstring(data)
+
+        items = root.findall(".//item")
+        for item in items[:max_results]:
+            title_elem = item.find("title")
+            link_elem = item.find("link")
+            desc_elem = item.find("description")
+            pubdate_elem = item.find("pubDate")
+
+            title = clean_html(title_elem.text) if title_elem is not None and title_elem.text else ""
+            link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
+            desc = clean_html(desc_elem.text) if desc_elem is not None and desc_elem.text else ""
+            pub_date = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else ""
+
+            if title and link:
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": desc[:200] if desc else "",
+                    "pub_date": pub_date,
+                    "source": "Solidot",
+                })
+
+        print(f"    Solidot RSS: {len(results)}条")
+
+    except Exception as e:
+        print(f"    Solidot RSS异常: {e}")
+
+    return results
+
+
+# ============ 数据源5: B站视频搜索 ============
+
+def search_bilibili(query, num=10):
+    """
+    B站视频搜索API（/search/all/v2接口，无需Cookie即可使用）
+    支持关键词搜索，返回视频标题、链接、播放量、发布时间
+    国内直连，无需翻墙
+    注意：请求间隔需>3秒避免风控
+    """
+    results = []
+    try:
+        params = {
+            "keyword": query,
+            "page": 1,
+            "page_size": num,
+            "order": "pubdate",  # 按发布时间排序，优先获取最新视频
+        }
+        url = "https://api.bilibili.com/x/web-interface/search/all/v2?" + urllib.parse.urlencode(params)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://search.bilibili.com/",
+        }
+        if BILIBILI_COOKIE:
+            headers["Cookie"] = BILIBILI_COOKIE
+
+        data = http_get(url, headers=headers)
+        resp = json.loads(data.decode("utf-8"))
+
+        if resp.get("code") != 0:
+            print(f"    B站搜索返回: code={resp.get('code')}, msg={resp.get('message', '')}")
+            return results
+
+        # v2接口数据结构: data.result是数组，每项有result_type和data
+        # 视频在result_type=="video"的项中
+        result_groups = resp.get("data", {}).get("result", [])
+        video_items = []
+        for group in result_groups:
+            if group.get("result_type") == "video":
+                video_items = group.get("data", [])
+                break
+
+        if not video_items:
+            print(f"    B站搜索 ({query}): 0条")
+            return results
+
+        for item in video_items[:num]:
+            # B站标题含<em class="keyword">高亮标签，需清理
+            title = clean_html(item.get("title", "")).strip()
+            # B站返回的arcurl就是视频链接
+            video_url = item.get("arcurl", "").strip()
+            # 描述也含HTML标签
+            description = clean_html(item.get("description", "")).strip()
+            author = item.get("author", "").strip()
+            play_count = item.get("play", 0)
+            duration = item.get("duration", "").strip()
+            # pubdate是Unix时间戳，转为日期字符串
+            pub_timestamp = item.get("pubdate", 0)
+            if pub_timestamp:
+                pub_date = datetime.fromtimestamp(pub_timestamp, tz=CST).strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                pub_date = ""
+
+            # 播放量格式化
+            if isinstance(play_count, int) and play_count >= 10000:
+                play_str = f"{play_count / 10000:.1f}万"
+            else:
+                play_str = str(play_count) if play_count else ""
+
+            # 来源标签：B站 + 作者 + 播放量 + 时长
+            source_parts = ["B站"]
+            if author:
+                source_parts.append(author)
+            if play_str:
+                source_parts.append(f"▶{play_str}")
+            if duration:
+                source_parts.append(duration)
+            source = " · ".join(source_parts)
+
+            if title and video_url:
+                results.append({
+                    "title": title,
+                    "url": video_url,
+                    "snippet": description[:200] if description else "",
+                    "pub_date": pub_date,
+                    "source": source,
+                })
+
+        print(f"    B站搜索 ({query}): {len(results)}条")
+
+    except Exception as e:
+        print(f"    B站搜索异常: {e}")
 
     return results
 
 
 # ============ 统一搜索入口 ============
 
+# 外骨骼相关关键词（用于天行数据API搜索和本地过滤）
+SEARCH_KEYWORDS = [
+    "外骨骼",
+    "外骨骼机器人",
+    "exoskeleton",
+    "exoskeleton robot",
+]
+
+# 本地过滤关键词（用于RSS源标题+摘要匹配）
+FILTER_KEYWORDS = [
+    "外骨骼", "exoskeleton",
+    "康复机器人", "助力机器人", "增强型机器人",
+    "可穿戴机器人", "穿戴式助力",
+    "动力外衣", "机械外衣",
+    "人机增强", "人体增强",
+]
+
+
+def is_exoskeleton_related(title, snippet=""):
+    """判断文章是否与外骨骼相关"""
+    text = (title + " " + snippet).lower()
+    for kw in FILTER_KEYWORDS:
+        if kw.lower() in text:
+            return True
+    return False
+
+
 def search_all():
-    """使用RSS/API数据源搜索外骨骼资讯"""
+    """使用国内数据源搜索外骨骼资讯"""
     all_results = []
 
-    # 精简搜索关键词（RSS/News搜索自带相关性排序，不需要修饰词）
-    search_queries = [
-        "外骨骼",
-        "外骨骼机器人",
-        "exoskeleton",
-        "exoskeleton robot",
-    ]
-
-    # 数据源1: Google News RSS（主力）
-    print("\n📡 数据源1: Google News RSS")
-    for query in search_queries:
-        print(f"  搜索: {query}")
-        results = search_google_news_rss(query)
-        all_results.extend(results)
-        time.sleep(random.uniform(0.3, 1.0))
-
-    # 数据源2: Bing News RSS（补充）
-    print("\n📡 数据源2: Bing News RSS")
-    for query in search_queries[:2]:
-        print(f"  搜索: {query}")
-        results = search_bing_news_rss(query)
-        all_results.extend(results)
-        time.sleep(random.uniform(0.3, 1.0))
-
-    # 数据源3: DuckDuckGo API（兜底）
-    if len(all_results) < 5:
-        print("\n📡 数据源3: DuckDuckGo API（兜底）")
-        for query in search_queries[:2]:
+    # 数据源1: 天行数据新闻API（主力，支持关键词搜索）
+    if TIANAPI_KEY:
+        print("\n📡 数据源1: 天行数据新闻API（主力）")
+        for query in SEARCH_KEYWORDS:
             print(f"  搜索: {query}")
-            results = search_duckduckgo_api(query)
+            results = search_tianapi_news(query, num=10)
             all_results.extend(results)
-            time.sleep(random.uniform(0.3, 1.0))
+            time.sleep(random.uniform(0.5, 1.0))
+    else:
+        print("\n⚠️ 天行数据API未配置(TIANAPI_KEY)，跳过主力数据源")
+        print("  免费注册获取key: https://www.tianapi.com")
+
+    # 数据源2: 36氪RSS（本地过滤外骨骼相关）
+    print("\n📡 数据源2: 36氪RSS")
+    kr_results = search_36kr_rss(max_results=50)
+    for r in kr_results:
+        if is_exoskeleton_related(r["title"], r.get("snippet", "")):
+            all_results.append(r)
+    print(f"    36氪过滤后: {len([r for r in kr_results if is_exoskeleton_related(r['title'], r.get('snippet', ''))])}条")
+
+    # 数据源3: InfoQ中文RSS（本地过滤）
+    print("\n📡 数据源3: InfoQ中文RSS")
+    infoq_results = search_infoq_rss(max_results=30)
+    for r in infoq_results:
+        if is_exoskeleton_related(r["title"], r.get("snippet", "")):
+            all_results.append(r)
+    print(f"    InfoQ过滤后: {len([r for r in infoq_results if is_exoskeleton_related(r['title'], r.get('snippet', ''))])}条")
+
+    # 数据源4: Solidot RSS（本地过滤）
+    print("\n📡 数据源4: Solidot RSS")
+    solidot_results = search_solidot_rss(max_results=30)
+    for r in solidot_results:
+        if is_exoskeleton_related(r["title"], r.get("snippet", "")):
+            all_results.append(r)
+    print(f"    Solidot过滤后: {len([r for r in solidot_results if is_exoskeleton_related(r['title'], r.get('snippet', ''))])}条")
+
+    # 数据源5: B站视频搜索（支持关键词搜索，结果直接归为video分类）
+    print("\n📡 数据源5: B站视频搜索")
+    for query in ["外骨骼", "外骨骼机器人", "exoskeleton"]:
+        print(f"  搜索: {query}")
+        bili_results = search_bilibili(query, num=10)
+        # B站搜索结果直接是视频，标记为video分类
+        for r in bili_results:
+            r["category"] = "video"
+        all_results.extend(bili_results)
+        # B站请求间隔，避免风控
+        time.sleep(random.uniform(3.0, 5.0))
 
     return all_results
 
@@ -300,13 +488,13 @@ def categorize_item(title, snippet):
     """根据标题和内容分类"""
     text = (title + " " + snippet).lower()
 
-    if any(kw in text for kw in ["bilibili", "哔哩哔哩", "b站", "抖音", "视频", "video", "youtube", "youku"]):
+    if any(kw in text for kw in ["bilibili", "哔哩哔哩", "b站", "抖音", "视频", "video", "youtube", "youku", "直播"]):
         return "video"
 
-    if any(kw in text for kw in ["研究", "科研", "论文", "学术", "patent", "research", "study", "breakthrough", "中科院", "研究所", "university", "期刊", "nature", "science", "ieee", "journal"]):
+    if any(kw in text for kw in ["研究", "科研", "论文", "学术", "patent", "research", "study", "breakthrough", "中科院", "研究所", "university", "期刊", "nature", "science", "ieee", "journal", "专利", "突破", "成果"]):
         return "research"
 
-    if any(kw in text for kw in ["融资", "投资", "轮", "产品", "发布", "launch", "funding", "investment", "series", "million", "billion", "product", "首发", "上市", "获投", "startup"]):
+    if any(kw in text for kw in ["融资", "投资", "轮", "产品", "发布", "launch", "funding", "investment", "series", "million", "billion", "product", "首发", "上市", "获投", "startup", "创企", "公司"]):
         return "company"
 
     return "news"
@@ -320,10 +508,8 @@ def _title_similarity(title1, title2):
     t2 = re.sub(r'[^\w\u4e00-\u9fff]', '', title2).lower()
     if not t1 or not t2:
         return 0.0
-    # 互相包含
     if t1 in t2 or t2 in t1:
         return 1.0
-    # 最长公共子串
     shorter, longer = (t1, t2) if len(t1) <= len(t2) else (t2, t1)
     max_match = 0
     for i in range(len(shorter)):
@@ -335,7 +521,6 @@ def _title_similarity(title1, title2):
 
 def _extract_keywords(title):
     """从标题中提取关键词用于去重判断"""
-    # 提取4字以上的词作为关键词
     text = re.sub(r'[^\w\u4e00-\u9fff]', '', title).lower()
     keywords = set()
     for i in range(len(text) - 3):
@@ -344,7 +529,7 @@ def _extract_keywords(title):
 
 
 def deduplicate(results):
-    """按URL和标题去重（增强版：支持标题相似度+关键词重叠去重）"""
+    """按URL和标题去重（增强版）"""
     seen_urls = set()
     seen_titles = []
     unique = []
@@ -353,24 +538,24 @@ def deduplicate(results):
         url = r.get("url", "")
         title = r.get("title", "").strip()
 
-        if url in seen_urls:
+        # URL标准化去重（去掉查询参数中的追踪标识）
+        normalized_url = re.sub(r'[?&](f=rss|utm_[^&=]+=[^&]*)', '', url)
+
+        if normalized_url in seen_urls:
             continue
 
         title_simple = re.sub(r'[^\w\u4e00-\u9fff]', '', title).lower()
         is_duplicate = False
 
-        # 1. 精确匹配
         if title_simple and title_simple in [re.sub(r'[^\w\u4e00-\u9fff]', '', st).lower() for st in seen_titles]:
             is_duplicate = True
 
-        # 2. 相似度匹配（>0.6认为是同一篇）
         if not is_duplicate:
             for seen_title in seen_titles:
                 if _title_similarity(title, seen_title) > 0.6:
                     is_duplicate = True
                     break
 
-        # 3. 关键词重叠检测（4字以上关键词重叠>=4个认为是重复）
         if not is_duplicate:
             current_kw = _extract_keywords(title)
             for seen_title in seen_titles:
@@ -383,7 +568,7 @@ def deduplicate(results):
         if is_duplicate:
             continue
 
-        seen_urls.add(url)
+        seen_urls.add(normalized_url)
         if title_simple:
             seen_titles.append(title)
 
@@ -394,7 +579,7 @@ def deduplicate(results):
 
 # ============ 时效性过滤 ============
 
-def filter_recent(results, days=7):
+def filter_recent(results, days=RECENT_DAYS):
     """只保留最近N天的结果"""
     recent = []
     for r in results:
@@ -427,19 +612,17 @@ def build_push_content(all_results, push_index):
             source = item.get("source", "")
             date_display = format_date_display(item.get("pub_date", ""))
             meta_parts = []
-            if source and source not in ("Google News", "Bing News"):
+            if source:
                 meta_parts.append(source)
             if date_display:
                 meta_parts.append(date_display)
             meta = f"（{' · '.join(meta_parts)}）" if meta_parts else ""
 
             url = item.get("url", "")
-            # 企业微信支持Markdown链接，把标题做成可点击链接
             if url:
                 lines.append(f"{i}. [{item['title']}]({url}){meta}")
             else:
                 lines.append(f"{i}. {item['title']}{meta}")
-
         lines.append("")
 
     add_section("🎬", "视频推荐", videos)
@@ -517,7 +700,8 @@ def send_markdown_to_wechat(content):
 
 def main():
     print("=" * 50)
-    print("外骨骼资讯推送脚本 v3 启动")
+    print("外骨骼资讯推送脚本 v5 启动")
+    print(f"版本特性: 国内直连数据源 + B站视频搜索，无需VPN")
     print(f"时间: {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
@@ -537,20 +721,23 @@ def main():
     print(f"当前推送: 第{push_index}期")
 
     # 搜索
-    print("\n开始搜索（RSS/API数据源）...")
+    print("\n开始搜索（国内数据源）...")
     all_results = search_all()
+
+    print(f"\n搜索总计: {len(all_results)} 条")
 
     # 去重
     unique_results = deduplicate(all_results)
-    print(f"\n去重后: {len(unique_results)} 条")
+    print(f"去重后: {len(unique_results)} 条")
 
-    # 时效性过滤（7天内）
-    recent_results = filter_recent(unique_results, days=7)
-    print(f"7天内: {len(recent_results)} 条")
+    # 时效性过滤（3天内）
+    recent_results = filter_recent(unique_results, days=RECENT_DAYS)
+    print(f"{RECENT_DAYS}天内: {len(recent_results)} 条")
 
-    # 分类
+    # 分类（B站结果已预设为video，保留不覆盖）
     for r in recent_results:
-        r["category"] = categorize_item(r["title"], r.get("snippet", ""))
+        if r.get("category") != "video":
+            r["category"] = categorize_item(r["title"], r.get("snippet", ""))
 
     # 排序：视频 > 科研 > 资讯 > 公司
     category_order = {"video": 0, "research": 1, "news": 2, "company": 3}
@@ -567,12 +754,12 @@ def main():
     print(preview)
     print("-" * 50)
 
-    # 企业微信文本消息限制2048字符
+    # 企业微信markdown消息限制2048字符
     if len(content) > 2000:
         content = content[:1990] + "\n...更多内容下期见"
         print("消息过长，已截断")
 
-    # 发送（改用markdown消息类型支持可点击链接）
+    # 发送（markdown消息类型支持可点击链接）
     print("\n正在推送到企业微信群...")
     success = send_markdown_to_wechat(content)
 
