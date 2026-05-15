@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-外骨骼资讯自动推送脚本 v6
-核心改动：跨次运行去重，同一条资讯只推送一次
-数据源：天行数据新闻API(主力) + B站视频搜索 + 36氪RSS + InfoQ中文RSS + Solidot RSS
+外骨骼资讯自动推送脚本 v7
+核心改动：扩展产业链关键词 + 增加行业数据源 + 跨次运行去重
+数据源：天行数据新闻API + 百度新闻搜索 + B站视频搜索 + 微博搜索
+        + 36氪RSS + InfoQ中文RSS + Solidot RSS + 中国机器人网RSS
 所有链接国内直连，无需翻墙
 推送历史通过pushed_history.json持久化，配合GitHub Actions Cache跨次运行
 """
@@ -405,23 +406,228 @@ def search_bilibili(query, num=10):
     return results
 
 
+# ============ 数据源6: 百度新闻搜索 ============
+
+def search_baidu_news(query, num=10):
+    """
+    百度新闻搜索
+    国内直连，覆盖面广，能搜到大量供应商和产业链信息
+    通过百度资讯搜索接口抓取
+    """
+    results = []
+    try:
+        params = {
+            "wd": query,
+            "tn": "news",
+            "rn": num,
+            "ie": "utf-8",
+            "cl": 2,  # 按时间排序
+        }
+        url = "https://www.baidu.com/s?" + urllib.parse.urlencode(params)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+
+        data = http_get(url, headers=headers)
+        html = data.decode("utf-8", errors="ignore")
+
+        # 解析百度搜索结果
+        # 百度资讯结果在<div class="result-op">或<div class="c-container">中
+        # 使用正则提取标题和链接
+        pattern = r'<a[^>]*data-click[^>]*href="([^"]*)"[^>]*>(.*?)</a>'
+        matches = re.findall(pattern, html, re.DOTALL)
+
+        for link, title_html in matches[:num]:
+            title = clean_html(title_html).strip()
+            if not title or len(title) < 4:
+                continue
+            # 百度链接是跳转链接，尝试提取真实URL
+            if link.startswith("http://www.baidu.com/link") or link.startswith("https://www.baidu.com/link"):
+                real_url = link  # 保留跳转链接，用户点击后百度会重定向
+            else:
+                real_url = link
+
+            # 提取来源和时间（百度结果中通常包含）
+            source_match = re.search(r'class="c-color-gray"[^>]*>(.*?)<', html[html.find(title_html):html.find(title_html)+500] if title_html in html else "")
+            source = source_match.group(1).strip() if source_match else "百度资讯"
+
+            results.append({
+                "title": title,
+                "url": real_url,
+                "snippet": "",
+                "pub_date": "",
+                "source": source if source else "百度资讯",
+            })
+
+        print(f"    百度资讯 ({query}): {len(results)}条")
+
+    except Exception as e:
+        print(f"    百度资讯异常: {e}")
+
+    return results
+
+
+# ============ 数据源7: 微博搜索 ============
+
+def search_weibo(query, num=10):
+    """
+    微博移动版搜索
+    国内直连，能搜到供应商动态、行业资讯、展会信息
+    使用移动端HTML接口，无需Cookie
+    """
+    results = []
+    try:
+        params = {
+            "keyword": query,
+            "page": 1,
+        }
+        url = "https://m.weibo.cn/api/container/getIndex?" + urllib.parse.urlencode(params)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        data = http_get(url, headers=headers)
+        resp = json.loads(data.decode("utf-8"))
+
+        cards = resp.get("data", {}).get("cards", [])
+        for card in cards:
+            # 微博搜索结果在card_group中
+            card_group = card.get("card_group", [])
+            for item in card_group:
+                mblog = item.get("mblog", {})
+                if not mblog:
+                    continue
+
+                title = mblog.get("status_title", "") or mblog.get("page_title", "")
+                text = clean_html(mblog.get("text", ""))
+                if not title:
+                    # 用微博正文前40字作为标题
+                    title = text[:40].replace("\n", " ").strip()
+                    if not title:
+                        continue
+
+                weibo_id = mblog.get("id", "")
+                weibo_url = f"https://m.weibo.cn/detail/{weibo_id}" if weibo_id else ""
+
+                # 发布时间
+                created_at = mblog.get("created_at", "")
+                if created_at:
+                    try:
+                        # 微博时间格式: "Fri May 15 09:00:00 +0800 2026"
+                        dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+                        pub_date = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        pub_date = ""
+                else:
+                    pub_date = ""
+
+                author = mblog.get("user", {}).get("screen_name", "")
+
+                results.append({
+                    "title": title,
+                    "url": weibo_url,
+                    "snippet": text[:200] if text else "",
+                    "pub_date": pub_date,
+                    "source": f"微博 · {author}" if author else "微博",
+                })
+
+        print(f"    微博搜索 ({query}): {len(results)}条")
+
+    except Exception as e:
+        print(f"    微博搜索异常: {e}")
+
+    return results
+
+
+# ============ 数据源8: 中国机器人网RSS ============
+
+def search_robotchina_rss(max_results=30):
+    """
+    中国机器人网RSS
+    国内直连，覆盖机器人产业新闻、供应商动态
+    不支持关键词搜索，返回最新文章后本地过滤
+    """
+    results = []
+    try:
+        url = "https://www.robotchina.com/rss.xml"
+        data = http_get(url)
+        root = ET.fromstring(data)
+
+        items = root.findall(".//item")
+        for item in items[:max_results]:
+            title_elem = item.find("title")
+            link_elem = item.find("link")
+            desc_elem = item.find("description")
+            pubdate_elem = item.find("pubDate")
+
+            title = clean_html(title_elem.text) if title_elem is not None and title_elem.text else ""
+            link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
+            desc = clean_html(desc_elem.text) if desc_elem is not None and desc_elem.text else ""
+            pub_date = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else ""
+
+            if title and link:
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": desc[:200] if desc else "",
+                    "pub_date": pub_date,
+                    "source": "中国机器人网",
+                })
+
+        print(f"    中国机器人网RSS: {len(results)}条")
+
+    except Exception as e:
+        print(f"    中国机器人网RSS异常: {e}")
+
+    return results
+
+
 # ============ 统一搜索入口 ============
 
-# 外骨骼相关关键词（用于天行数据API搜索和本地过滤）
+# 外骨骼相关关键词（用于天行数据API搜索和B站搜索）
+# 天行数据免费会员100次/天，每个关键词调2个endpoint，控制在8个关键词以内（16次）
 SEARCH_KEYWORDS = [
     "外骨骼",
     "外骨骼机器人",
     "exoskeleton",
-    "exoskeleton robot",
+    "康复外骨骼",
+    "工业外骨骼",
+    "外骨骼电机",
+    "外骨骼传感器",
+    "外骨骼驱动",
 ]
 
 # 本地过滤关键词（用于RSS源标题+摘要匹配）
 FILTER_KEYWORDS = [
+    # 外骨骼核心
     "外骨骼", "exoskeleton",
     "康复机器人", "助力机器人", "增强型机器人",
     "可穿戴机器人", "穿戴式助力",
     "动力外衣", "机械外衣",
     "人机增强", "人体增强",
+    # 零配件/硬件（限定在外骨骼语境下才匹配）
+    "外骨骼电机", "外骨骼传感器", "外骨骼驱动",
+    "外骨骼减速器", "外骨骼执行器", "外骨骼控制器",
+    # 软件/算法
+    "外骨骼算法", "外骨骼控制",
+    "步态分析", "意图识别",
+    "人机交互", "肌电控制",
+    # 材料
+    "外骨骼碳纤维", "外骨骼轻量化",
+    # 电池/能源
+    "外骨骼电池",
+    # 分类
+    "康复外骨骼", "工业外骨骼", "军用外骨骼",
+    "医疗外骨骼",
+    # 产业链
+    "外骨骼产业链", "外骨骼供应商",
+    "机器人关节", "机器人驱动",
 ]
 
 
@@ -435,7 +641,7 @@ def is_exoskeleton_related(title, snippet=""):
 
 
 def search_all():
-    """使用国内数据源搜索外骨骼资讯"""
+    """使用国内数据源搜索外骨骼资讯（v7：扩展产业链关键词+增加行业数据源）"""
     all_results = []
 
     # 数据源1: 天行数据新闻API（主力，支持关键词搜索）
@@ -443,48 +649,73 @@ def search_all():
         print("\n📡 数据源1: 天行数据新闻API（主力）")
         for query in SEARCH_KEYWORDS:
             print(f"  搜索: {query}")
-            results = search_tianapi_news(query, num=10)
+            results = search_tianapi_news(query, num=5)
             all_results.extend(results)
-            time.sleep(random.uniform(0.5, 1.0))
+            time.sleep(random.uniform(0.3, 0.6))
     else:
         print("\n⚠️ 天行数据API未配置(TIANAPI_KEY)，跳过主力数据源")
         print("  免费注册获取key: https://www.tianapi.com")
 
-    # 数据源2: 36氪RSS（本地过滤外骨骼相关）
-    print("\n📡 数据源2: 36氪RSS")
+    # 数据源2: 百度新闻搜索（覆盖面广，供应商信息多）
+    print("\n📡 数据源2: 百度新闻搜索")
+    baidu_queries = ["外骨骼", "外骨骼机器人", "外骨骼电机", "外骨骼传感器", "外骨骼驱动", "康复外骨骼", "工业外骨骼", "exoskeleton"]
+    for query in baidu_queries:
+        print(f"  搜索: {query}")
+        baidu_results = search_baidu_news(query, num=8)
+        all_results.extend(baidu_results)
+        time.sleep(random.uniform(1.0, 2.0))
+
+    # 数据源3: B站视频搜索（支持关键词搜索，结果直接归为video分类）
+    print("\n📡 数据源3: B站视频搜索")
+    bili_queries = ["外骨骼", "外骨骼机器人", "外骨骼电机", "康复外骨骼", "exoskeleton"]
+    for query in bili_queries:
+        print(f"  搜索: {query}")
+        bili_results = search_bilibili(query, num=8)
+        for r in bili_results:
+            r["category"] = "video"
+        all_results.extend(bili_results)
+        time.sleep(random.uniform(3.0, 5.0))
+
+    # 数据源4: 微博搜索（供应商动态、展会信息）
+    print("\n📡 数据源4: 微博搜索")
+    weibo_queries = ["外骨骼", "外骨骼机器人", "康复外骨骼", "外骨骼展会"]
+    for query in weibo_queries:
+        print(f"  搜索: {query}")
+        weibo_results = search_weibo(query, num=8)
+        all_results.extend(weibo_results)
+        time.sleep(random.uniform(1.0, 2.0))
+
+    # 数据源5: 36氪RSS（本地过滤外骨骼相关）
+    print("\n📡 数据源5: 36氪RSS")
     kr_results = search_36kr_rss(max_results=50)
     for r in kr_results:
         if is_exoskeleton_related(r["title"], r.get("snippet", "")):
             all_results.append(r)
     print(f"    36氪过滤后: {len([r for r in kr_results if is_exoskeleton_related(r['title'], r.get('snippet', ''))])}条")
 
-    # 数据源3: InfoQ中文RSS（本地过滤）
-    print("\n📡 数据源3: InfoQ中文RSS")
+    # 数据源6: InfoQ中文RSS（本地过滤）
+    print("\n📡 数据源6: InfoQ中文RSS")
     infoq_results = search_infoq_rss(max_results=30)
     for r in infoq_results:
         if is_exoskeleton_related(r["title"], r.get("snippet", "")):
             all_results.append(r)
     print(f"    InfoQ过滤后: {len([r for r in infoq_results if is_exoskeleton_related(r['title'], r.get('snippet', ''))])}条")
 
-    # 数据源4: Solidot RSS（本地过滤）
-    print("\n📡 数据源4: Solidot RSS")
+    # 数据源7: Solidot RSS（本地过滤）
+    print("\n📡 数据源7: Solidot RSS")
     solidot_results = search_solidot_rss(max_results=30)
     for r in solidot_results:
         if is_exoskeleton_related(r["title"], r.get("snippet", "")):
             all_results.append(r)
     print(f"    Solidot过滤后: {len([r for r in solidot_results if is_exoskeleton_related(r['title'], r.get('snippet', ''))])}条")
 
-    # 数据源5: B站视频搜索（支持关键词搜索，结果直接归为video分类）
-    print("\n📡 数据源5: B站视频搜索")
-    for query in ["外骨骼", "外骨骼机器人", "exoskeleton"]:
-        print(f"  搜索: {query}")
-        bili_results = search_bilibili(query, num=10)
-        # B站搜索结果直接是视频，标记为video分类
-        for r in bili_results:
-            r["category"] = "video"
-        all_results.extend(bili_results)
-        # B站请求间隔，避免风控
-        time.sleep(random.uniform(3.0, 5.0))
+    # 数据源8: 中国机器人网RSS（本地过滤，覆盖产业链）
+    print("\n📡 数据源8: 中国机器人网RSS")
+    robot_results = search_robotchina_rss(max_results=40)
+    for r in robot_results:
+        if is_exoskeleton_related(r["title"], r.get("snippet", "")):
+            all_results.append(r)
+    print(f"    中国机器人网过滤后: {len([r for r in robot_results if is_exoskeleton_related(r['title'], r.get('snippet', ''))])}条")
 
     return all_results
 
@@ -492,11 +723,26 @@ def search_all():
 # ============ 分类 ============
 
 def categorize_item(title, snippet):
-    """根据标题和内容分类"""
+    """根据标题和内容分类（v7：增加供应商/零配件分类）"""
     text = (title + " " + snippet).lower()
 
     if any(kw in text for kw in ["bilibili", "哔哩哔哩", "b站", "抖音", "视频", "video", "youtube", "youku", "直播"]):
         return "video"
+
+    # 供应商/零配件/软件
+    supplier_kws = [
+        "电机", "伺服", "无刷", "步进", "传感器", "力传感", "肌电", "imu", "惯性",
+        "减速器", "谐波", "行星", "rv减速", "执行器", "推杆", "人工肌肉",
+        "驱动器", "驱动板", "控制器", "控制板",
+        "碳纤维", "钛合金", "轻量化", "材料",
+        "电池", "锂电", "续航", "充电",
+        "算法", "步态", "意图识别", "阻抗控制", "自适应控制",
+        "供应商", "产业链", "零配件", "配件", "零部件",
+        "展会", "博览会", "展览会", "发布会",
+        "采购", "招标", "合作", "代理", "经销",
+    ]
+    if any(kw in text for kw in supplier_kws):
+        return "supplier"
 
     if any(kw in text for kw in ["研究", "科研", "论文", "学术", "patent", "research", "study", "breakthrough", "中科院", "研究所", "university", "期刊", "nature", "science", "ieee", "journal", "专利", "突破", "成果"]):
         return "research"
@@ -701,6 +947,7 @@ def build_push_content(all_results, push_index):
 
     videos = [r for r in all_results if r["category"] == "video"]
     research = [r for r in all_results if r["category"] == "research"]
+    supplier = [r for r in all_results if r["category"] == "supplier"]
     company = [r for r in all_results if r["category"] == "company"]
     news_list = [r for r in all_results if r["category"] == "news"]
 
@@ -731,10 +978,11 @@ def build_push_content(all_results, push_index):
 
     add_section("🎬", "视频推荐", videos)
     add_section("🔬", "科研进展", research)
+    add_section("🔧", "供应链动态", supplier)
     add_section("📰", "行业资讯", news_list)
     add_section("💰", "公司动态", company)
 
-    if not any([videos, research, company, news_list]):
+    if not any([videos, research, supplier, company, news_list]):
         lines.append("今天暂时没找到新的外骨骼资讯，下次再看看 👀")
 
     return "\n".join(lines)
@@ -804,8 +1052,8 @@ def send_markdown_to_wechat(content):
 
 def main():
     print("=" * 50)
-    print("外骨骼资讯推送脚本 v6 启动")
-    print(f"版本特性: 跨次去重 + 国内直连数据源 + B站视频搜索，无需VPN")
+    print("外骨骼资讯推送脚本 v7 启动")
+    print(f"版本特性: 产业链关键词扩展 + 8大数据源 + 跨次去重，无需VPN")
     print(f"时间: {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
@@ -851,8 +1099,8 @@ def main():
         if r.get("category") != "video":
             r["category"] = categorize_item(r["title"], r.get("snippet", ""))
 
-    # 排序：视频 > 科研 > 资讯 > 公司
-    category_order = {"video": 0, "research": 1, "news": 2, "company": 3}
+    # 排序：视频 > 科研 > 供应商 > 资讯 > 公司
+    category_order = {"video": 0, "research": 1, "supplier": 2, "news": 3, "company": 4}
     new_results.sort(key=lambda x: category_order.get(x["category"], 99))
 
     print(f"\n最终推送: {len(new_results)} 条新资讯")
