@@ -1,0 +1,27 @@
+name: 外骨骼资讯定时推送
+
+on:
+  schedule:
+    # 每天 9:00, 15:00, 21:00 (UTC+8)
+    - cron: '0 1 * * *'   # 09:00 CST
+    - cron: '0 7 * * *'   # 15:00 CST
+    - cron: '0 13 * * *'  # 21:00 CST
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  push-exoskeleton-news:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run push script
+        env:
+          WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
+        run: python exoskeleton_bot.py
