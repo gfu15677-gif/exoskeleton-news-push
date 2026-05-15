@@ -21,7 +21,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run push script
+            - name: Run push script
         env:
           WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
+          TIANAPI_KEY: ${{ secrets.TIANAPI_KEY }}
+          BILIBILI_COOKIE: ${{ secrets.BILIBILI_COOKIE }}
         run: python exoskeleton_bot.py
