@@ -1,31 +1,27 @@
 name: 外骨骼资讯定时推送
-
 on:
   schedule:
-    # 每天 9:00, 15:00, 21:00 (UTC+8)
-    - cron: '0 1 * * *'   # 09:00 CST
-    - cron: '0 7 * * *'   # 15:00 CST
-    - cron: '0 13 * * *'  # 21:00 CST
-  workflow_dispatch:  # 支持手动触发
-
+    - cron: '0 1 * * *'
+    - cron: '0 13 * * *'
+  workflow_dispatch:
 jobs:
   push-exoskeleton-news:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
+      - name: Restore push history cache
+        uses: actions/cache@v4
+        with:
+          path: pushed_history.json
+          key: exoskeleton-push-history-${{ github.run_id }}
+          restore-keys: |
+            exoskeleton-push-history-
       - name: Run push script
         env:
           WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
           TIANAPI_KEY: ${{ secrets.TIANAPI_KEY }}
           BILIBILI_COOKIE: ${{ secrets.BILIBILI_COOKIE }}
         run: python exoskeleton_bot.py
-
-
